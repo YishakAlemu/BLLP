@@ -7,6 +7,7 @@ import { User } from "../user/user.model";
 import { CURRENT_SEASON } from "./season.config";
 import { calculateTier } from "./tier.utils";
 import { getSeasonReward } from "./season.rewards";
+import { updateAchievementProgress } from "../../services/achievement.service";
 
 interface AuthRequest extends Request {
   user?: {
@@ -15,12 +16,18 @@ interface AuthRequest extends Request {
   };
 }
 
-export const reviewLesson = async (req: Request, res: Response) => {
+export const reviewFlashcard = async (req: Request, res: Response) => {
   const authReq = req as AuthRequest;
   const userId = authReq.user!.id;
 
   try {
-    const { lessonId, quality } = req.body;
+    const { targetId, type, quality } = req.body;
+
+    if (type !== "VOCABULARY") {
+      return res.status(400).json({
+        message: "Only VOCABULARY flashcards are supported by this endpoint",
+      });
+    }
 
     if (quality < 0 || quality > 5) {
       return res.status(400).json({
@@ -29,12 +36,17 @@ export const reviewLesson = async (req: Request, res: Response) => {
     }
 
     // ===== PROGRESS (SM-2) =====
-    let progress = await Progress.findOne({ userId, lessonId });
+    let progress = await Progress.findOne({
+      userId,
+      contentId: targetId,
+      contentType: "VOCABULARY",
+    });
 
     if (!progress) {
       progress = new Progress({
         userId,
-        lessonId,
+        contentId: targetId,
+        contentType: "VOCABULARY",
       });
     }
 
@@ -56,39 +68,8 @@ export const reviewLesson = async (req: Request, res: Response) => {
     await progress.save();
 
     // ===== STREAK & DAILY GOAL =====
-    let stats = await StudyStats.findOne({ userId });
-
-    if (!stats) {
-      stats = new StudyStats({ userId });
-    }
-
-    const today = getStartOfDay(new Date());
-    const lastStudy = stats.lastStudyDate
-      ? getStartOfDay(stats.lastStudyDate)
-      : null;
-
-    if (!lastStudy) {
-      stats.currentStreak = 1;
-      stats.todayCount = 1;
-    } else {
-      const diffDays =
-        (today.getTime() - lastStudy.getTime()) / (1000 * 60 * 60 * 24);
-
-      if (diffDays === 0) {
-        stats.todayCount += 1;
-      } else if (diffDays === 1) {
-        stats.currentStreak += 1;
-        stats.todayCount = 1;
-      } else {
-        stats.currentStreak = 1;
-        stats.todayCount = 1;
-      }
-    }
-
-    stats.longestStreak = Math.max(stats.longestStreak, stats.currentStreak);
-
-    stats.lastStudyDate = new Date();
-    await stats.save();
+    const { updateStreakAndDailyGoal } = require("../../services/streak.service");
+    let stats = await updateStreakAndDailyGoal(userId);
 
     if (stats.seasonId !== CURRENT_SEASON.id) {
       stats.seasonId = CURRENT_SEASON.id;
@@ -122,9 +103,30 @@ export const reviewLesson = async (req: Request, res: Response) => {
 
     await stats.save();
 
+    // Trigger achievement progress in background
+    setImmediate(async () => {
+      try {
+        const { updateAchievementProgress, updateQuestProgress } = require("../../services/achievement.service");
+        
+        await updateAchievementProgress(userId, "LESSONS", 1); // 1 lesson finished
+        await updateAchievementProgress(userId, "STREAK", stats.currentStreak); // pass total streak exactly or bump by 1 if you defined increment
+        await updateAchievementProgress(userId, "TOTAL_XP", xpEarned); 
+        
+        await updateQuestProgress(userId, "LESSONS", 1);
+        await updateQuestProgress(userId, "XP", xpEarned);
+        if (quality === 5) {
+          await updateQuestProgress(userId, "ACCURACY", 1);
+        }
+      } catch (err) {
+        console.error("Background achievement update failed", err);
+      }
+    });
+
     // ===== RESPONSE =====
     return res.json({
-      message: "Review recorded",
+      message: "Flashcard review recorded",
+      targetId,
+      type,
       nextReview: progress.nextReview,
       streak: stats.currentStreak,
       todayCount: stats.todayCount,
@@ -142,15 +144,27 @@ export const reviewLesson = async (req: Request, res: Response) => {
   }
 };
 
+export const reviewLesson = reviewFlashcard;
+
 export const getDueLessons = async (req: Request, res: Response) => {
   try {
     const authReq = req as AuthRequest;
     const userId = authReq.user!.id;
 
-    const dueLessons = await Progress.find({
+    const dueProgress = await Progress.find({
       userId,
+      contentType: "LESSON",
       nextReview: { $lte: new Date() },
-    }).populate("lessonId");
+    }).lean();
+
+    const lessonIds = dueProgress.map((p) => p.contentId);
+    const lessons = await Lesson.find({ _id: { $in: lessonIds } }).lean();
+    const lessonMap = new Map(lessons.map((lesson: any) => [lesson._id.toString(), lesson]));
+
+    const dueLessons = dueProgress.map((p: any) => ({
+      ...p,
+      lessonId: lessonMap.get(p.contentId.toString()) || null,
+    }));
 
     res.json(dueLessons);
   } catch {
@@ -171,67 +185,88 @@ export const startStudySession = async (req: Request, res: Response) => {
     // ===== FETCH POOLS =====
     const dueProgress = await Progress.find({
       userId,
+      contentType: "VOCABULARY",
       nextReview: { $lte: now },
-    }).populate("lessonId");
+    }).lean();
 
     const weakProgress = await Progress.find({
       userId,
+      contentType: "VOCABULARY",
       easeFactor: { $lt: 2.0 },
       nextReview: { $gt: now },
-    }).populate("lessonId");
+    }).lean();
 
-    const seenProgress = await Progress.find({ userId }).select("lessonId");
-    const seenIds = seenProgress.map((p) => p.lessonId.toString());
+    const seenProgress = await Progress.find({ userId, contentType: "VOCABULARY" })
+      .select("contentId")
+      .lean();
+    const seenIds = new Set(seenProgress.map((p: any) => p.contentId.toString()));
 
-    const newLessons = await Lesson.find({
-      _id: { $nin: seenIds },
-      isVerified: true,
-    });
+    const lessons = await Lesson.find({ isVerified: true }).lean();
 
-    // ===== EXTRACT LESSON OBJECTS =====
-    const dueLessons = dueProgress.map((p) => p.lessonId);
-    const weakLessons = weakProgress.map((p) => p.lessonId);
+    const allVocabulary = lessons.flatMap((lesson: any) =>
+      (lesson.vocabulary || []).map((vocab: any) => ({
+        lessonId: lesson._id.toString(),
+        vocabId: vocab._id.toString(),
+        am: vocab.am,
+        ao: vocab.ao,
+      })),
+    );
+
+    const vocabularyMap = new Map(
+      allVocabulary.map((vocab) => [vocab.vocabId, vocab]),
+    );
+
+    const newVocabulary = allVocabulary.filter((vocab) => !seenIds.has(vocab.vocabId));
+
+    const dueVocabulary = dueProgress
+      .map((p: any) => vocabularyMap.get(p.contentId.toString()))
+      .filter(Boolean);
+
+    const weakVocabulary = weakProgress
+      .map((p: any) => vocabularyMap.get(p.contentId.toString()))
+      .filter(Boolean);
 
     // Shuffle helper
     const shuffle = (arr: any[]) => arr.sort(() => Math.random() - 0.5);
 
-    const shuffledDue = shuffle([...dueLessons]);
-    const shuffledWeak = shuffle([...weakLessons]);
-    const shuffledNew = shuffle([...newLessons]);
+    const shuffledDue = shuffle([...dueVocabulary]);
+    const shuffledWeak = shuffle([...weakVocabulary]);
+    const shuffledNew = shuffle([...newVocabulary]);
 
-    // ... Shuffling code stays same ...
+    // Gather random seen vocabulary to pad the session
+    const seenVocabulary = allVocabulary.filter(vocab => seenIds.has(vocab.vocabId));
+    const shuffledSeen = shuffle([...seenVocabulary]);
 
-    // ===== SENIOR PICKING LOGIC =====
-    // We prioritize Due, then Weak, then New until we hit the LIMIT.
+    // Prioritize due cards first, then weak, then unseen cards, then random casual practice.
     const combinedPool = [
       ...shuffledDue,
       ...shuffledWeak,
-      ...shuffledNew
+      ...shuffledNew,
+      ...shuffledSeen
     ];
 
-    const sessionLessons: any[] = [];
+    const sessionFlashcards: any[] = [];
     const usedIds = new Set<string>();
 
-    for (const lesson of combinedPool) {
-      if (sessionLessons.length >= limit) break; // Fill up to the limit (e.g., 10)
+    for (const flashcard of combinedPool) {
+      if (sessionFlashcards.length >= limit) break;
       
-      const id = lesson._id.toString();
+      const id = flashcard.vocabId;
       if (!usedIds.has(id)) {
-        sessionLessons.push(lesson);
+        sessionFlashcards.push(flashcard);
         usedIds.add(id);
       }
     }
 
-    // Final check: if still empty, your Lesson collection might be empty or unverified
     return res.json({
-      lessons: sessionLessons,
-      userStats: authReq.user, // Ensure this matches your frontend UserStats interface!
+      flashcards: sessionFlashcards,
+      userStats: authReq.user,
       breakdown: {
         due: shuffledDue.length,
         weak: shuffledWeak.length,
         new: shuffledNew.length,
       },
-      total: sessionLessons.length,
+      total: sessionFlashcards.length,
     });
   } catch (error) {
     console.error(error);
@@ -269,11 +304,16 @@ export const getWeakAreas = async (req: Request, res: Response) => {
     // 1️⃣ Weak lessons (low ease factor)
     const weakProgress = await Progress.find({
       userId,
+      contentType: "LESSON",
       easeFactor: { $lt: 2.0 },
-    }).populate("lessonId");
+    }).lean();
+
+    const weakLessonIds = weakProgress.map((p: any) => p.contentId);
+    const weakLessonDocs = await Lesson.find({ _id: { $in: weakLessonIds } }).lean();
+    const weakLessonMap = new Map(weakLessonDocs.map((lesson: any) => [lesson._id.toString(), lesson]));
 
     const weakLessons = weakProgress.map((p) => ({
-      lesson: p.lessonId,
+      lesson: weakLessonMap.get((p as any).contentId.toString()) || null,
       easeFactor: p.easeFactor,
       interval: p.interval,
       repetition: p.repetition,
@@ -282,8 +322,9 @@ export const getWeakAreas = async (req: Request, res: Response) => {
     // 2️⃣ Aggregate weak topics
     const topicMap: Record<string, number> = {};
 
-    weakProgress.forEach((p) => {
-      const lesson: any = p.lessonId;
+    weakProgress.forEach((p: any) => {
+      const lesson: any = weakLessonMap.get(p.contentId.toString());
+      if (!lesson) return;
       const topicId = lesson.topicId.toString();
 
       topicMap[topicId] = (topicMap[topicId] || 0) + 1;

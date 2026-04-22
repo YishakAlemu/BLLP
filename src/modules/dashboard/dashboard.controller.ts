@@ -15,7 +15,7 @@ export const getDashboardSummary = async (req: AuthRequest, res: Response) => {
     if (!req.user?.id) {
       return res.status(401).json({
         success: false,
-        message: "Unauthorized"
+        message: "Unauthorized",
       });
     }
 
@@ -37,7 +37,10 @@ export const getDashboardSummary = async (req: AuthRequest, res: Response) => {
 
     const progressAggregationPromise = Progress.aggregate([
       {
-        $match: { userId }
+        $match: {
+          userId,
+          contentType: "LESSON",
+        },
       },
 
       {
@@ -45,7 +48,7 @@ export const getDashboardSummary = async (req: AuthRequest, res: Response) => {
           /** Due Reviews */
           dueReviews: [
             { $match: { nextReview: { $lte: now } } },
-            { $count: "count" }
+            { $count: "count" },
           ],
 
           /** Weak Topics */
@@ -54,20 +57,20 @@ export const getDashboardSummary = async (req: AuthRequest, res: Response) => {
             {
               $lookup: {
                 from: "lessons",
-                localField: "lessonId",
+                localField: "contentId",
                 foreignField: "_id",
-                as: "lesson"
-              }
+                as: "lesson",
+              },
             },
             { $unwind: "$lesson" },
             {
               $group: {
                 _id: "$lesson.topicId",
-                weakCount: { $sum: 1 }
-              }
+                weakCount: { $sum: 1 },
+              },
             },
             { $sort: { weakCount: -1 } },
-            { $limit: 3 }
+            { $limit: 3 },
           ],
 
           /** Mastery Score */
@@ -75,44 +78,43 @@ export const getDashboardSummary = async (req: AuthRequest, res: Response) => {
             {
               $group: {
                 _id: null,
-                avgEase: { $avg: "$easeFactor" }
-              }
-            }
+                avgEase: { $avg: "$easeFactor" },
+              },
+            },
           ],
 
           /** Lessons completed today */
           lessonsToday: [
             {
               $match: {
-                completed: true,
-                updatedAt: { $gte: todayStart }
-              }
+                createdAt: { $gte: todayStart },
+              },
             },
-            { $count: "count" }
+            { $count: "count" },
           ],
 
           /** Reviews done today */
           reviewsToday: [
             {
               $match: {
-                reviewedAt: { $gte: todayStart }
-              }
+                lastReviewed: { $gte: todayStart },
+              },
             },
-            { $count: "count" }
+            { $count: "count" },
           ],
 
           /** Continue lesson */
           continueLesson: [
-            { $match: { completed: false } },
+            { $match: { repetition: { $lte: 0 } } },
             { $sort: { updatedAt: -1 } },
             { $limit: 1 },
             {
               $lookup: {
                 from: "lessons",
-                localField: "lessonId",
+                localField: "contentId",
                 foreignField: "_id",
-                as: "lesson"
-              }
+                as: "lesson",
+              },
             },
             { $unwind: "$lesson" },
             {
@@ -120,12 +122,12 @@ export const getDashboardSummary = async (req: AuthRequest, res: Response) => {
                 _id: 0,
                 id: "$lesson._id",
                 title: "$lesson.title",
-                topicId: "$lesson.topicId"
-              }
-            }
-          ]
-        }
-      }
+                topicId: "$lesson.topicId",
+              },
+            },
+          ],
+        },
+      },
     ]);
 
     /**
@@ -141,7 +143,7 @@ export const getDashboardSummary = async (req: AuthRequest, res: Response) => {
     const [stats, progressAggregation, recommendedLesson] = await Promise.all([
       statsPromise,
       progressAggregationPromise,
-      recommendedLessonPromise
+      recommendedLessonPromise,
     ]);
 
     const agg = progressAggregation?.[0] ?? {};
@@ -157,6 +159,12 @@ export const getDashboardSummary = async (req: AuthRequest, res: Response) => {
 
     const continueLesson = agg?.continueLesson?.[0] ?? null;
 
+    // ... (keep all your existing aggregation code above this)
+
+    const isReviewPriority = dueReviews > 15; // Set your threshold
+    const reviewUrgency =
+      dueReviews > 25 ? "critical" : dueReviews > 0 ? "medium" : "none";
+
     return res.status(200).json({
       success: true,
       data: {
@@ -164,33 +172,35 @@ export const getDashboardSummary = async (req: AuthRequest, res: Response) => {
           xp: stats?.xp ?? 0,
           level: stats?.level ?? 1,
           streak: stats?.currentStreak ?? 0,
-          tier: stats?.seasonTier ?? "Bronze"
+          tier: stats?.seasonTier ?? "Bronze",
         },
-
         actions: {
-          dueReviews,
+          dueCount: dueReviews,
+          isReviewPriority,
+          reviewUrgency, // Tells UI to pulse or disable 'Continue'
           recommendedLesson,
-          continueLesson
+          continueLesson,
         },
-
         insights: {
           weakTopics,
-          mastery
+          mastery,
         },
-
         activity: {
           lessonsToday,
-          reviewsToday
-        }
-      }
+          reviewsToday,
+          // Expose the goals! Fallback to 50 XP/Items if not set
+          dailyGoal: stats?.dailyGoal ?? 50,
+          // If you don't track todayCount directly yet, you can calculate a pseudo-XP for now:
+          todayCount: stats?.todayCount ?? lessonsToday * 10 + reviewsToday * 5,
+        },
+      },
     });
-
-  } catch (error: any) {
+  } catch (error) {
     console.error(error);
 
     return res.status(500).json({
       success: false,
-      message: "Dashboard aggregation failed: " + (error.message || error)
+      message: "Dashboard aggregation failed"
     });
   }
 };
