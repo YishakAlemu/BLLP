@@ -102,6 +102,6 @@ app.get("/", (req, res) => {
   res.send("API Running");
 });
 
-app.listen(ENV.PORT, () => {
-  console.log(`Server running on port ${ENV.PORT}`);
+app.listen(Number(ENV.PORT), "0.0.0.0", () => {
+  console.log(`Server running on port ${ENV.PORT} (0.0.0.0)`);
 });

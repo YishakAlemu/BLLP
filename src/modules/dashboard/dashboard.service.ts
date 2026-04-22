@@ -17,7 +17,7 @@ export const getRecommendedLesson = async (userId: string) => {
 
   // 2️⃣ Find highest order completed
   const highestOrder = Math.max(
-    ...completed.map((p: any) => p.lessonId.order)
+    ...completed.map((p: any) => p.lessonId?.order ?? 0)
   );
 
   // 3️⃣ Suggest next lesson in sequence

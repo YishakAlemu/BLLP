@@ -185,12 +185,12 @@ export const getDashboardSummary = async (req: AuthRequest, res: Response) => {
       }
     });
 
-  } catch (error) {
+  } catch (error: any) {
     console.error(error);
 
     return res.status(500).json({
       success: false,
-      message: "Dashboard aggregation failed"
+      message: "Dashboard aggregation failed: " + (error.message || error)
     });
   }
 };

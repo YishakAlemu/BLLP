@@ -33,7 +33,13 @@ export const register = async (req: Request, res: Response) => {
       role: Role.LEARNER,
     });
 
-    res.status(201).json({ id: user._id, username: user.username });
+    // 5️⃣ Token Generation
+    const token = generateToken({
+      id: user._id.toString(),
+      role: user.role,
+    });
+
+    res.status(201).json({ token, id: user._id, username: user.username });
   } catch (error) {
     console.error("Register Error:", error);
     res.status(500).json({ message: "Server error", error: error instanceof Error ? error.message : String(error) });
