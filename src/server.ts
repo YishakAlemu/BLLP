@@ -2,6 +2,7 @@ import express from "express";
 import http from "http";
 import { Server as SocketIOServer } from "socket.io";
 import cors from "cors";
+import cookieParser from "cookie-parser";
 import dotenv from "dotenv";
 import { connectDB } from "./config/db";
 import authRoutes from "./modules/auth/auth.routes";
@@ -27,6 +28,7 @@ import chatRoutes from "./modules/chat/chat.routes";
 import reportRoutes from "./modules/chat/report.routes";
 import expertRoutes from "./modules/expert/expert.routes";
 import youtubeVideoRoutes from "./modules/video/youtubeVideo.routes";
+import adminRoutes from "./modules/admin/admin.routes";
 import { startNotificationJobs } from "./cron/notification.jobs";
 import { startQuestJobs } from "./cron/quest.jobs";
 import { v2 as cloudinary } from 'cloudinary';
@@ -133,8 +135,13 @@ app.get('/api-docs.json', (_req, res) => {
   res.setHeader("Content-Type", "application/json");
   res.send(swaggerSpec);
 });
-app.use(cors());
+const corsOrigins = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(",").map((origin) => origin.trim())
+  : true;
+
+app.use(cors({ origin: corsOrigins, credentials: true }));
 app.use(express.json());
+app.use(cookieParser());
 
 // Serve the uploads directory statically so you can access it via URL
 app.use("/uploads", express.static(path.join(__dirname, "../public/uploads")));
@@ -161,6 +168,7 @@ app.use("/api/chat", chatRoutes);
 app.use("/api/reports", reportRoutes);
 app.use("/api/expert", expertRoutes);
 app.use("/api/youtube-videos", youtubeVideoRoutes);
+app.use("/api/admin", adminRoutes);
 
 app.get("/", (req, res) => {
   res.send("API Running");

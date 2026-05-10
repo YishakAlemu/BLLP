@@ -1,24 +1,37 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import fs from "fs";
+import { Storage, Bucket } from "@google-cloud/storage";
 import path from "path";
+import fs from "fs";
 
 export class GeminiAudioService {
   private genAI: GoogleGenerativeAI;
   private model: any;
-  private uploadDir: string;
+  private storage: Storage;
+  private bucket: Bucket;
 
   constructor() {
-    const apiKey =  "AIzaSyCU8UBfM-YqqywQS8tHjWogFDDpd1HbK9Q" 
-    //"AIzaSyDYW9kxlAT-STi1duR6cU_TLsJI4S8rDDg";
+    const apiKey = (process.env.GEMINI_API_KEY || "").trim();
+    if (!apiKey) {
+      throw new Error("[GeminiAudioService] Missing GEMINI_API_KEY in environment variables.");
+    }
     this.genAI = new GoogleGenerativeAI(apiKey);
     
     this.model = this.genAI.getGenerativeModel({ model: "gemini-2.5-flash-preview-tts" });
     
-    // FIX: Match the actual return path by adding "vocabulary" to the directory creation
-    this.uploadDir = path.join(process.cwd(), "public", "uploads", "vocabulary");
-    if (!fs.existsSync(this.uploadDir)) {
-      fs.mkdirSync(this.uploadDir, { recursive: true });
+    // Initialize Google Cloud Storage
+    const bucketName = process.env.GCS_BUCKET_NAME || "";
+    if (!bucketName) {
+      throw new Error("[GeminiAudioService] Missing GCS_BUCKET_NAME in environment variables.");
     }
+
+    // Storage automatically uses GOOGLE_APPLICATION_CREDENTIALS if present.
+    // On Cloud Run, it uses the service's identity automatically.
+    const keyPath = path.join(process.cwd(), "gcp-service-account.json");
+    this.storage = fs.existsSync(keyPath) 
+      ? new Storage({ keyFilename: keyPath })
+      : new Storage();
+      
+    this.bucket = this.storage.bucket(bucketName);
   }
 
   async generateLessonAudio(text: string, language: 'amharic' | 'oromo'): Promise<string> {
@@ -49,13 +62,22 @@ export class GeminiAudioService {
       const wavBuffer = this.addWavHeader(pcmBuffer, 24000); 
 
       const fileName = `${language}_${Date.now()}.wav`;
-      const filePath = path.join(this.uploadDir, fileName);
-      fs.writeFileSync(filePath, wavBuffer);
+      
+      // Upload to Google Cloud Storage
+      const file = this.bucket.file(fileName);
+      await file.save(wavBuffer, {
+        metadata: {
+          contentType: 'audio/wav',
+          cacheControl: 'public, max-age=31536000', // Cache for 1 year
+        },
+      });
 
-      return `/uploads/vocabulary/${fileName}`;
+      console.log(`[GeminiAudioService] Successfully uploaded ${fileName} to GCS bucket ${this.bucket.name}`);
+
+      // Return the public Google Cloud Storage URL
+      return `https://storage.googleapis.com/${this.bucket.name}/${fileName}`;
 
     } catch (error: any) {
-      // FIX: Throw the error so the controller knows it failed!
       console.error(`❌ [GeminiAudioService] Error:`, error.message);
       throw error; 
     }
